@@ -1,0 +1,40 @@
+services:
+  # Separate Postgres for your weather data.
+  # (Astro already runs its own "postgres" service for Airflow's metadata,
+  #  so this one needs a different name and host port.)
+  weather-db:
+    image: postgres:16
+    container_name: weather-db
+    restart: unless-stopped
+    # POSTGRES_USER, POSTGRES_PASSWORD and POSTGRES_DB come from .env
+    env_file:
+      - .env
+    ports:
+      - "5433:5432"   # host:container - connect from your laptop on 5433
+    volumes:
+      - weather_db_data:/var/lib/postgresql/data
+    healthcheck:
+      # $$ makes the variables resolve inside the container
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Join the network Astro creates for the Airflow containers,
+    # so Airflow can reach this service by name.
+    networks:
+      - airflow
+
+  pgadmin:
+    image: dpage/pgadmin4
+    # PGADMIN_DEFAULT_EMAIL and PGADMIN_DEFAULT_PASSWORD come from .env
+    env_file:
+      - .env
+    ports:
+      - "5050:80"
+    depends_on:
+      - weather-db
+    networks:
+      - airflow
+
+volumes:
+  weather_db_data:
