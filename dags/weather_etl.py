@@ -1,22 +1,24 @@
-"""
-Canada weather ETL: Code 2's structure (separate tasks, hooks, connections)
-combined with Code 1's multi-city loop.
 
-Uses these Airflow connections:
-  open_meteo_api    (HTTP, host https://api.open-meteo.com)
-  postgres_default  (your weather database)
-"""
+import os
 from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.decorators import task
+from airflow.providers.databricks.hooks.databricks_sql import DatabricksSqlHook
+from airflow.providers.databricks.operators.databricks import DatabricksRunNowOperator
 from airflow.providers.http.hooks.http import HttpHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 POSTGRES_CONN_ID = "postgres_default"
 API_CONN_ID = "open_meteo_api"
+DATABRICKS_CONN_ID = "databricks_default"
 
-# Largest Canadian cities plus every provincial/territorial capital
+
+DATABRICKS_CATALOG = "workspace"
+DATABRICKS_SCHEMA = "weather"
+DATABRICKS_TABLE = f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}.weather_canada"
+
+
 CANADA_CITIES = [
     {"name": "Toronto", "province": "ON", "lat": 43.6532, "lon": -79.3832},
     {"name": "Montreal", "province": "QC", "lat": 45.5019, "lon": -73.5674},
@@ -52,7 +54,7 @@ default_args = {
     "retry_delay": timedelta(minutes=5),
 }
 
-## DAG
+
 with DAG(
     dag_id="weather_etl_pipeline",
     default_args=default_args,
@@ -95,19 +97,19 @@ with DAG(
                     "windspeed": current["windspeed"],
                     "winddirection": current["winddirection"],
                     "weathercode": current["weathercode"],
+                    "observed_at": current["time"],  # UTC, from the API
                 }
             )
         return rows
 
     @task()
     def load_weather_data(rows):
-        """Load all rows into PostgreSQL in a single transaction."""
+        """Load all rows into the local PostgreSQL database in one transaction."""
         pg_hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
         conn = pg_hook.get_conn()
         cursor = conn.cursor()
 
         try:
-            # Create table if it doesn't exist
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS weather_canada (
                 city TEXT,
@@ -122,7 +124,6 @@ with DAG(
             );
             """)
 
-            # Insert one row per city
             for row in rows:
                 cursor.execute("""
                 INSERT INTO weather_canada
@@ -148,7 +149,83 @@ with DAG(
             cursor.close()
             conn.close()
 
-    ## DAG Workflow - ETL Pipeline
+    @task()
+    def load_to_databricks(rows):
+        """Push the same rows into a Delta table in Databricks.
+
+        Databricks runs in the cloud and can't reach the Postgres container on
+        your laptop, so Airflow sends the data to Databricks instead.
+        MERGE makes re-runs safe: a reading already stored is not added twice.
+        """
+        hook = DatabricksSqlHook(databricks_conn_id=DATABRICKS_CONN_ID)
+
+        hook.run(f"CREATE SCHEMA IF NOT EXISTS {DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}")
+        hook.run(f"""
+            CREATE TABLE IF NOT EXISTS {DATABRICKS_TABLE} (
+                city          STRING,
+                province      STRING,
+                latitude      DOUBLE,
+                longitude     DOUBLE,
+                temperature   DOUBLE,
+                windspeed     DOUBLE,
+                winddirection DOUBLE,
+                weathercode   INT,
+                observed_at   TIMESTAMP,
+                loaded_at     TIMESTAMP
+            )
+        """)
+
+
+        placeholders = []
+        params = {}
+        for i, row in enumerate(rows):
+            placeholders.append(
+                f"(:city_{i}, :province_{i}, :latitude_{i}, :longitude_{i}, "
+                f":temperature_{i}, :windspeed_{i}, :winddirection_{i}, "
+                f":weathercode_{i}, :observed_at_{i})"
+            )
+            for key, value in row.items():
+                params[f"{key}_{i}"] = value
+
+        hook.run(
+            f"""
+            MERGE INTO {DATABRICKS_TABLE} AS target
+            USING (
+                SELECT city, province,
+                       CAST(latitude AS DOUBLE)      AS latitude,
+                       CAST(longitude AS DOUBLE)     AS longitude,
+                       CAST(temperature AS DOUBLE)   AS temperature,
+                       CAST(windspeed AS DOUBLE)     AS windspeed,
+                       CAST(winddirection AS DOUBLE) AS winddirection,
+                       CAST(weathercode AS INT)      AS weathercode,
+                       CAST(observed_at AS TIMESTAMP) AS observed_at
+                FROM VALUES {", ".join(placeholders)}
+                    AS t(city, province, latitude, longitude, temperature,
+                         windspeed, winddirection, weathercode, observed_at)
+            ) AS source
+            ON  target.city = source.city
+            AND target.province = source.province
+            AND target.observed_at = source.observed_at
+            WHEN NOT MATCHED THEN INSERT
+                (city, province, latitude, longitude, temperature,
+                 windspeed, winddirection, weathercode, observed_at, loaded_at)
+            VALUES
+                (source.city, source.province, source.latitude, source.longitude,
+                 source.temperature, source.windspeed, source.winddirection,
+                 source.weathercode, source.observed_at, current_timestamp())
+            """,
+            parameters=params,
+        )
+
+
+    run_databricks_analysis = DatabricksRunNowOperator(
+        task_id="run_databricks_analysis",
+        databricks_conn_id=DATABRICKS_CONN_ID,
+        job_id=os.getenv("DATABRICKS_ANALYSIS_JOB_ID"),
+    )
+
+    
     weather_data = extract_weather_data()
     transformed_data = transform_weather_data(weather_data)
     load_weather_data(transformed_data)
+    load_to_databricks(transformed_data) >> run_databricks_analysis
